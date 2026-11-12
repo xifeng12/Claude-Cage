@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestProjectPickerConsumerAddsOnceAndReusesAuthorizedDirectory(t *testing.T) {
@@ -129,5 +130,28 @@ func TestProjectPickerRejectsLifecycleRacesAndUntrustedRequests(t *testing.T) {
 	s.account.lock()
 	if w := request(s, "POST", "/api/projects/open", s.origin, string(body), true); w.Code != 423 {
 		t.Fatal("locked account could authorize project", w.Code)
+	}
+}
+
+// A short monitor operation should not cause an authorized project open to
+// fail immediately with HTTP 409.
+func TestProjectPickerWaitsForTransientOperationLock(t *testing.T) {
+	s := testServer(t)
+	s.ready = true
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	s.projectShares = map[string]*projectShare{root: {done: make(chan struct{})}}
+	body, _ := json.Marshal(map[string]any{"workspace": root, "add": true})
+
+	s.op.Lock()
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(90 * time.Millisecond)
+		s.op.Unlock()
+		close(released)
+	}()
+	w := request(s, "POST", "/api/projects/open", s.origin, string(body), true)
+	<-released
+	if w.Code != 200 {
+		t.Fatalf("brief monitor lock rejected project access: %d %s", w.Code, w.Body.String())
 	}
 }

@@ -1,6 +1,7 @@
 package workbench
 
 import (
+	"context"
 	"path/filepath"
 
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
@@ -11,6 +12,12 @@ var physicalProxyInterface = managedproxy.PhysicalInterface
 // The lifecycle lock is held by monitorNetwork. Schedule a regular job so a
 // user stop can cancel recovery and pause can still revoke the gate immediately.
 func (s *Server) monitorProxyInterface() {
+	s.monitorProxyInterfaceWithProbe(physicalProxyInterface)
+}
+
+// The probe may be sampled outside the lifecycle lock; all decisions and
+// mutations still run inside the existing serialized monitor operation.
+func (s *Server) monitorProxyInterfaceWithProbe(probe func(context.Context) (string, error)) {
 	if s.busy() {
 		return
 	}
@@ -18,7 +25,7 @@ func (s *Server) monitorProxyInterface() {
 	if err != nil || cfg.RequireManagedProxy(s.profile) != nil {
 		return
 	}
-	name, err := physicalProxyInterface(s.lifetimeContext())
+	name, err := probe(s.lifetimeContext())
 	if err != nil {
 		_ = s.closeProxyGate(err.Error())
 		s.mu.Lock()

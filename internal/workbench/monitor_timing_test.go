@@ -212,3 +212,40 @@ func TestNetworkMonitorRecordsAllOuterStages(t *testing.T) {
 		t.Fatalf("slow interface check was not attributed: %v", records[0])
 	}
 }
+
+// A slow physical adapter lookup must not keep a project-opening request
+// from acquiring the shared lifecycle lock.
+func TestNetworkMonitorProbesOutsideOperationLock(t *testing.T) {
+	s := testServer(t)
+	previous := physicalProxyInterface
+	started := make(chan struct{})
+	physicalProxyInterface = func(ctx context.Context) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	defer func() { physicalProxyInterface = previous }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.monitorNetwork(ctx)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("physical adapter probe was not started")
+	}
+	if !s.op.TryLock() {
+		t.Fatal("physical adapter probe held the project operation lock")
+	}
+	s.op.Unlock()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("network monitor did not stop after cancellation")
+	}
+}
