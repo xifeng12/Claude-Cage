@@ -663,7 +663,19 @@ func (s *Server) apply(v savedProfile, validate bool) error {
 
 // Interface recovery uses the ordinary cancellable job queue. Location changes
 // remain governed by the saved exit policy and never replace its baseline.
+// A pre-sampled interface avoids holding the lifecycle lock while Windows
+// PowerShell queries the host's physical adapters. The guest gate is unchanged.
+type physicalInterfaceSample struct {
+	name string
+	err error
+	duration time.Duration
+}
+
 func (s *Server) monitorNetworkTick() {
+	s.monitorNetworkTickWithInterface(nil)
+}
+
+func (s *Server) monitorNetworkTickWithInterface(sample *physicalInterfaceSample) {
 	timing := s.startMonitorTiming()
 	defer s.recordMonitorTiming("network", timing)
 	if s.storageRecoveryStatus().Required {
@@ -674,8 +686,17 @@ func (s *Server) monitorNetworkTick() {
 		timing.result = "setup_pending"
 		return
 	}
-	s.monitorProxyInterface()
-	timing.stage("physical_interface")
+	if sample != nil {
+		s.monitorProxyInterfaceWithProbe(func(context.Context) (string, error) {
+			return sample.name, sample.err
+		})
+		timing.stages = append(timing.stages,
+			fmt.Sprintf("physical_interface_ms=%d", sample.duration.Milliseconds()),
+			"physical_interface_outside_lock=true")
+	} else {
+		s.monitorProxyInterface()
+		timing.stage("physical_interface")
+	}
 	s.checkProxyHealth()
 	timing.stage("proxy_health")
 	s.monitorSafety()
@@ -691,9 +712,26 @@ func (s *Server) monitorNetwork(ctx context.Context) {
 	defer ticker.Stop()
 	skipped := 0
 	for ctx.Err() == nil {
-		if s.op.TryLock() {
+		// Do not let a slow Windows adapter query monopolize the lock that
+		// user actions (including opening a project) also require. Acquire
+		// briefly first so a busy worker does not start an extra probe.
+		locked := s.op.TryLock()
+		var sample *physicalInterfaceSample
+		if locked {
+			s.op.Unlock()
+			started := time.Now()
+			name, err := physicalProxyInterface(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			sample = &physicalInterfaceSample{name: name, err: err, duration: time.Since(started)}
+			// Reacquire before inspecting configuration or changing the gate.
+			// Another user operation may have started during the probe.
+			locked = s.op.TryLock()
+		}
+		if locked {
 			skipped = 0
-			s.monitorNetworkTick()
+			s.monitorNetworkTickWithInterface(sample)
 			s.op.Unlock()
 		} else {
 			skipped++
